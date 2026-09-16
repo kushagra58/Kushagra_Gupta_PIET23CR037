@@ -300,3 +300,27 @@ def test_zero_refund_balance_reconciles_to_fully_refunded(client, app):
     with app.app_context():
         status = app.get_db().execute("SELECT deposit_status FROM loans WHERE id = ?", (loan_id,)).fetchone()["deposit_status"]
     assert status == "fully_refunded"
+
+
+def test_checkout_locks_to_the_signed_in_users_own_linked_borrower(client, app):
+    client.post("/items", data={"name": "Camera", "unit_count": "1", "deposit_amount": "0", "late_fee_per_day": "0"})
+    client.post("/login", data={"username": "handler", "password": "handler123"})
+    client.post("/borrowers", data={"name": "Aarav Sharma", "borrower_code": "B001"})
+    client.post("/borrowers", data={"name": "Riya Kapoor", "borrower_code": "B002", "link_to_me": "1"})
+    with app.app_context():
+        db = app.get_db()
+        unit_id = db.execute("SELECT id FROM units LIMIT 1").fetchone()["id"]
+        other_borrower_id = db.execute("SELECT id FROM borrowers WHERE borrower_code = 'B001'").fetchone()["id"]
+        own_borrower_id = db.execute("SELECT id FROM borrowers WHERE borrower_code = 'B002'").fetchone()["id"]
+
+    page = client.get("/checkout")
+    assert b"Riya Kapoor / B002" in page.data
+    assert b"Aarav Sharma / B001" not in page.data
+
+    # Even if a different borrower_id is submitted (e.g. a tampered request),
+    # the checkout is forced onto the signed-in user's own linked borrower.
+    client.post("/checkout", data={"unit_id": unit_id, "borrower_id": other_borrower_id, "due_at": "2031-01-01T09:00"}, follow_redirects=True)
+    with app.app_context():
+        loan = app.get_db().execute("SELECT borrower_id FROM loans ORDER BY id DESC LIMIT 1").fetchone()
+    assert loan["borrower_id"] == own_borrower_id
+    assert loan["borrower_id"] != other_borrower_id

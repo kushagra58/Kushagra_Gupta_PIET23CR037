@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('admin', 'operator')),
     is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    borrower_id INTEGER REFERENCES borrowers(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

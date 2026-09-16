@@ -23,7 +23,7 @@ debug reloader instead, run `.venv/bin/flask --app app run --debug`.
 ## Main workflows
 
 - Add an item with one or more physical units and optional deposit/late-fee defaults.
-- Add borrowers from the checkout screen.
+- Add borrowers from the checkout screen. Tick "This is me" while adding one to link it to your login — after that, checkout locks to that borrower only, and no other borrower can be picked from that account.
 - Check out now or reserve a unit for a future date range.
 - Transfer an active loan to another borrower while preserving the original due date and unit availability window.
 - Transfer requests remain pending until an admin approves them; rejected requests never change the current borrower.

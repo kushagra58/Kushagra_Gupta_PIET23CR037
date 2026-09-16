@@ -66,6 +66,9 @@ def create_app(test_config=None):
         for column, definition in (("status", "TEXT NOT NULL DEFAULT 'approved'"), ("requested_by_user_id", "INTEGER"), ("decided_by_user_id", "INTEGER"), ("decided_at", "TEXT"), ("decision_note", "TEXT NOT NULL DEFAULT ''")):
             if column not in transfer_columns:
                 db.execute(f"ALTER TABLE loan_transfers ADD COLUMN {column} {definition}")
+        user_columns = {row[1] for row in db.execute("PRAGMA table_info(users)").fetchall()}
+        if "borrower_id" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN borrower_id INTEGER REFERENCES borrowers(id) ON DELETE SET NULL")
         if app.config["AUTO_SEED"] and not app.config.get("TESTING"):
             from seed import expand_demo_data, seed_database
 
@@ -238,6 +241,19 @@ def create_app(test_config=None):
         flash("Sign in as admin or handler before changing lending data.", "error")
         return redirect(url_for("login", next=request.path))
 
+    def current_borrower(db):
+        """The borrower profile linked to the signed-in account, if any.
+
+        Once an account is linked to a borrower, checkout is locked to that
+        borrower only — nobody else can be picked for that login."""
+        user_id = session.get("user_id")
+        if not user_id:
+            return None
+        return db.execute(
+            "SELECT borrowers.* FROM users JOIN borrowers ON borrowers.id = users.borrower_id WHERE users.id = ?",
+            (user_id,),
+        ).fetchone()
+
     def refresh_overdue(db):
         db.execute("UPDATE loans SET status = 'overdue' WHERE returned_at IS NULL AND due_at < ?", (now().isoformat(sep=" "),))
         db.commit()
@@ -319,9 +335,14 @@ def create_app(test_config=None):
             return denied
         db = get_db()
         try:
-            db.execute("INSERT INTO borrowers (name, borrower_code, contact, club_department) VALUES (?, ?, ?, ?)",
+            new_borrower_id = db.execute("INSERT INTO borrowers (name, borrower_code, contact, club_department) VALUES (?, ?, ?, ?)",
                        (request.form["name"].strip(), request.form["borrower_code"].strip(),
-                        request.form.get("contact", "").strip(), request.form.get("club_department", "").strip()))
+                        request.form.get("contact", "").strip(), request.form.get("club_department", "").strip())).lastrowid
+            user_id = session.get("user_id")
+            if user_id and request.form.get("link_to_me") and current_borrower(db) is None:
+                # Only link when explicitly requested, so admin/handler staff
+                # adding borrowers on someone else's behalf stay unaffected.
+                db.execute("UPDATE users SET borrower_id = ? WHERE id = ?", (new_borrower_id, user_id))
             db.commit()
             flash("Borrower added.", "success")
         except sqlite3.IntegrityError:
@@ -336,10 +357,17 @@ def create_app(test_config=None):
             if denied:
                 return denied
         db = get_db()
+        locked_borrower = current_borrower(db)
         if request.method == "POST":
             try:
                 unit_id = int(request.form["unit_id"])
-                borrower_id = int(request.form["borrower_id"])
+                if locked_borrower is not None:
+                    # Signed-in account is linked to a borrower profile: that
+                    # profile is the only one this login can ever check out
+                    # for, so the submitted value is ignored rather than trusted.
+                    borrower_id = locked_borrower["id"]
+                else:
+                    borrower_id = int(request.form["borrower_id"])
                 start_at = parse_datetime(request.form.get("checkout_at"), now())
                 due_at = parse_datetime(request.form.get("due_at"))
                 if due_at is None:
@@ -376,7 +404,7 @@ def create_app(test_config=None):
                 flash(str(exc), "error")
         units = db.execute("SELECT units.*, items.name AS item_name FROM units JOIN items ON items.id = units.item_id WHERE units.status = 'available' ORDER BY items.name, units.asset_tag").fetchall()
         borrowers = db.execute("SELECT * FROM borrowers ORDER BY name").fetchall()
-        return render_template("checkout.html", units=units, borrowers=borrowers)
+        return render_template("checkout.html", units=units, borrowers=borrowers, locked_borrower=locked_borrower)
 
     @app.post("/loans/<int:loan_id>/return")
     def return_loan(loan_id):
