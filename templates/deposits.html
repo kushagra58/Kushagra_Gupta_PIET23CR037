@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}Deposits | Auriga Drive{% endblock %}
+{% block content %}
+<section class="page-heading compact"><div><p class="eyebrow">Finance / audit</p><h1>Deposit ledger.</h1><p class="lede">Held deposits and return settlements stay attached to their loan record.</p></div></section>
+<section class="section-block"><div class="table-wrap"><table><thead><tr><th>Loan</th><th>Borrower</th><th>Held</th><th>Late fee</th><th>Refund</th><th>Status</th></tr></thead><tbody>{% for loan in loans %}<tr><td><strong>{{ loan.item_name }}</strong><small>{{ loan.asset_tag }} &middot; due {{ loan.due_at|pretty_date }}</small></td><td>{{ loan.borrower_name }}</td><td>{{ loan.deposit_amount|money }}</td><td>{{ loan.late_fee|money }}</td><td>{{ loan.refund_amount|money if loan.refund_amount is not none else '-' }}</td><td><span class="status {% if loan.deposit_status == 'held' %}late{% endif %}">{{ loan.deposit_status|replace('_', ' ')|title }}</span></td></tr>{% else %}<tr><td colspan="6">No deposit records yet.</td></tr>{% endfor %}</tbody></table></div></section>
+{% endblock %}

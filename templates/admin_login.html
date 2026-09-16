@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block title %}Admin login | Auriga Drive{% endblock %}
+{% block content %}
+<section class="page-heading compact"><div><p class="eyebrow">Restricted area</p><h1>Admin control room.</h1><p class="lede">Manage unit condition and status, inspect payments, and use the authenticated API.</p></div></section>
+<section class="form-card narrow"><form method="post" action="{{ url_for('admin_login') }}"><label>Username<input name="username" value="admin" required></label><label>Password<input name="password" type="password" required></label><button class="button primary wide" type="submit">Sign in</button></form><p class="login-hint">The seeded local demo account is <strong>admin</strong> / <strong>admin123</strong>. Change it with `ADMIN_PASSWORD` before deployment.</p></section>
+{% endblock %}

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Auriga Drive{% endblock %}</title>
+  <script>document.documentElement.dataset.theme = localStorage.getItem('auriga-theme') || 'light';</script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{{ url_for('dashboard') }}"><span class="brand-mark">AD</span><span>Auriga Drive</span></a>
+    <nav>
+      <a href="{{ url_for('dashboard') }}">Dashboard</a>
+      <a href="{{ url_for('availability') }}">Availability</a>
+      <a href="{{ url_for('history') }}">History</a>
+      <a href="{{ url_for('deposits') }}">Deposits</a>
+      <a href="{{ url_for('admin') }}">Admin</a>
+      <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Switch color theme"><span id="theme-icon">&#9790;</span><span id="theme-label">Dark mode</span></button>
+      <a class="nav-action" href="{{ url_for('checkout') }}">+ Check out</a>
+    </nav>
+  </header>
+  <main class="shell">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}<div class="flash-stack">{% for category, message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}</div>{% endif %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+<script>
+  const themeToggle = document.getElementById('theme-toggle');
+  const themeIcon = document.getElementById('theme-icon');
+  const themeLabel = document.getElementById('theme-label');
+  function syncThemeButton() {
+    const dark = document.documentElement.dataset.theme === 'dark';
+    themeIcon.innerHTML = dark ? '&#9728;' : '&#9790;';
+    themeLabel.textContent = dark ? 'Light mode' : 'Dark mode';
+  }
+  syncThemeButton();
+  themeToggle.addEventListener('click', () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem('auriga-theme', next);
+    syncThemeButton();
+  });
+</script>
+</html>
