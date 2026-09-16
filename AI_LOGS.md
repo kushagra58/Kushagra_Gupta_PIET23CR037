@@ -89,3 +89,62 @@ full refund status updates, and regression coverage. Validation reached
 
 **AI:** Updated this log, README, and design reasoning to reflect the current
 implementation. Final validation and commit are being performed in this turn.
+
+## Turn 11
+
+**User:** Asked to update the project so an active loan can be transferred from
+one borrower to another while keeping the original due date and availability
+unchanged.
+
+**AI:** Added browser and admin JWT API transfer actions that update only the
+active loan's borrower. Added regression tests proving the due date, physical
+unit, and availability window remain unchanged. Validation reached `11 passed`.
+
+## Turn 12
+
+**User:** Asked for transfer completion details to show who received the item,
+and requested a `handler` account that can borrow/change lending data while
+other non-admin users cannot change records.
+
+**AI:** Added a handler account, browser/API permission checks, transfer audit
+rows with the recipient and acting username, persistent transfer details in the
+dashboard, and admin-only restrictions for refunds, deletions, and unit
+administration. Added handler transfer coverage.
+
+## Turn 13
+
+**User:** Asked for each borrower transfer to be reflected in History with the
+new borrower and the original due item details.
+
+**AI:** Updated History to show the current borrower, unchanged due date, and
+the complete transfer timeline with previous borrower, new borrower, acting
+account, and timestamp. Added regression coverage for the rendered history.
+
+## Turn 14
+
+**User:** Asked for the handler account to have the same power as admin and for
+handler/admin users to see total late fees and total refunds still needing to
+be returned.
+
+**AI:** Unified handler and admin permission gates, allowed the handler into
+the full control room and all mutation APIs, added aggregate finance cards to
+the Admin and Deposits pages, and added permission/finance regression coverage.
+
+## Turn 15
+
+**User:** Asked to add an option for due late fees.
+
+**AI:** Added a separate “Late fees due” finance total and a staff `Mark paid`
+action for pending late-fee payments. The payment ledger status changes from
+`due` to `paid`, and the loan totals are synchronized. Added regression
+coverage for the settlement flow.
+
+## Turn 16
+
+**User:** Asked for transfer requests to wait for admin approval before the
+borrower changes; without approval the UI should show waiting for approval.
+
+**AI:** Added pending/approved/rejected transfer states, requester and decision
+audit fields, an admin approval queue, approve/reject API actions, and pending
+status display in Dashboard and History. The current borrower, due date, and
+availability remain unchanged until approval. Validation reached `15 passed`.

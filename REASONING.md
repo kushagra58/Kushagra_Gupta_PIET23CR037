@@ -59,11 +59,18 @@ refund does not exceed `refund_due` before changing the deposit status.
 ## Authentication and administration
 
 JWT protects the JSON API. Authenticated users may read records, while tokens
-with the `admin` role may mutate items, units, borrowers, loans, and payments.
+with the `handler` or `admin` role may mutate all records, including payments
+and configuration. They intentionally share the same permission boundary.
 The browser admin area uses an operator session for practical form workflows.
 It can update unit condition, safely remove unused records, and settle partial
 or complete refunds. Foreign keys intentionally block deletion when a record
 is needed by units or historical loans.
+
+Unauthenticated browser visitors are read-only. The `handler` account is an
+alternate staff account with the same control-room permissions as `admin` for
+checkouts, returns, nudges, transfers, refunds, deletions, and unit
+administration. Finance views aggregate late fees and outstanding refunds so
+staff can see what was charged and what still needs to be returned.
 
 ## Item imagery and themes
 
@@ -80,6 +87,15 @@ Current loans are counted by borrower at checkout. If that count reaches the
 configured limit, the request is rejected with a clear message. Overdue loans
 are placed at the top of the dashboard, and a nudge action writes an auditable
 message to `nudge_log` and the application log.
+
+## Loan transfer
+
+Transferring an active loan updates only `loans.borrower_id`. The unit, loan
+start, due date, payments, and return history remain on the same loan row. This
+means the item continues to occupy exactly the same availability interval; a
+transfer cannot accidentally create a second booking or make the unit appear
+free. The browser dashboard offers the action directly, while the admin JWT
+API exposes `PATCH /api/loans/<id>/transfer`.
 
 ## Deliberate omissions
 

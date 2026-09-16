@@ -90,6 +90,12 @@ def admin_token(client):
     return response.get_json()["access_token"]
 
 
+def handler_token(client):
+    response = client.post("/api/auth/login", json={"username": "handler", "password": "handler123"})
+    assert response.status_code == 200
+    return response.get_json()["access_token"]
+
+
 def test_jwt_protects_api_and_admin_can_create_item(client):
     assert client.get("/api/items").status_code == 401
     token = admin_token(client)
@@ -169,6 +175,128 @@ def test_admin_can_settle_partial_then_full_refund(client, app):
     assert b"partially refunded" in partial.data
     assert status == "partially_refunded"
     client.post(f"/admin/loans/{loan_id}/refund", data={"amount": "60"}, follow_redirects=True)
+    with app.app_context():
+        status = app.get_db().execute("SELECT deposit_status FROM loans WHERE id = ?", (loan_id,)).fetchone()["deposit_status"]
+    assert status == "fully_refunded"
+
+
+def test_active_loan_can_transfer_borrower_without_changing_due_or_availability(client, app):
+    seed(client)
+    client.post("/borrowers", data={"name": "Bob Verma", "borrower_code": "B002"})
+    handler_login = client.post("/login", data={"username": "handler", "password": "handler123"})
+    unit_id, original_borrower_id = ids(app)
+    with app.app_context():
+        second_borrower_id = app.get_db().execute("SELECT id FROM borrowers WHERE borrower_code = 'B002'").fetchone()["id"]
+    checkout = client.post("/checkout", data={"unit_id": unit_id, "borrower_id": original_borrower_id, "checkout_at": "2030-06-01T09:00", "due_at": "2030-06-04T09:00"}, follow_redirects=True)
+    with app.app_context():
+        db = app.get_db()
+        loan = db.execute("SELECT id, due_at, unit_id FROM loans LIMIT 1").fetchone()
+        before = client.get("/availability?start=2030-06-02T00:00&end=2030-06-03T23:00").data
+    transferred = client.post(f"/loans/{loan['id']}/transfer", data={"borrower_id": second_borrower_id}, follow_redirects=True)
+    after = client.get("/availability?start=2030-06-02T00:00&end=2030-06-03T23:00").data
+    history = client.get("/history")
+    with app.app_context():
+        updated = app.get_db().execute("SELECT * FROM loans WHERE id = ?", (loan["id"],)).fetchone()
+    assert checkout.status_code == 200
+    assert handler_login.status_code == 302
+    assert b"waiting for admin approval" in transferred.data
+    assert b"Waiting for approval" in history.data
+    assert b"04 Jun 2030" in history.data
+    assert b"Aarav Sharma" in history.data
+    assert updated["borrower_id"] == original_borrower_id
+    assert updated["due_at"] == loan["due_at"]
+    assert updated["unit_id"] == loan["unit_id"]
+    assert before == after
+    with app.app_context():
+        transfer = app.get_db().execute("SELECT changed_by_user_id, status FROM loan_transfers WHERE loan_id = ?", (loan["id"],)).fetchone()
+        handler = app.get_db().execute("SELECT id FROM users WHERE username = 'handler'").fetchone()
+    assert transfer["changed_by_user_id"] == handler["id"]
+    assert transfer["status"] == "pending"
+
+
+def test_admin_api_can_transfer_active_loan(client, app):
+    seed(client)
+    client.post("/borrowers", data={"name": "Meera Iyer", "borrower_code": "B003"})
+    unit_id, borrower_id = ids(app)
+    with app.app_context():
+        target_id = app.get_db().execute("SELECT id FROM borrowers WHERE borrower_code = 'B003'").fetchone()["id"]
+    client.post("/checkout", data={"unit_id": unit_id, "borrower_id": borrower_id, "due_at": "2030-06-04T09:00"})
+    with app.app_context():
+        loan = app.get_db().execute("SELECT id, due_at FROM loans LIMIT 1").fetchone()
+    response = client.patch(f"/api/loans/{loan['id']}/transfer", json={"borrower_id": target_id}, headers={"Authorization": f"Bearer {admin_token(client)}"})
+    assert response.status_code == 200
+    assert response.get_json()["borrower_id"] == borrower_id
+    assert response.get_json()["transfer_status"] == "pending"
+    assert response.get_json()["due_at"] == loan["due_at"]
+    with app.app_context():
+        transfer_id = app.get_db().execute("SELECT id FROM loan_transfers WHERE loan_id = ?", (loan["id"],)).fetchone()["id"]
+    approved = client.patch(f"/api/transfer-requests/{transfer_id}/approve", headers={"Authorization": f"Bearer {admin_token(client)}"})
+    assert approved.status_code == 200
+    assert client.get(f"/api/loans/{loan['id']}", headers={"Authorization": f"Bearer {admin_token(client)}"}).get_json()["borrower_id"] == target_id
+
+
+def test_anonymous_browser_cannot_change_lending_data(tmp_path):
+    application = create_app({"TESTING": False, "AUTO_SEED": False, "DATABASE": str(tmp_path / "anonymous.sqlite3")})
+    with application.app_context():
+        application.init_db()
+    response = application.test_client().post("/items", data={"name": "Blocked Item", "unit_count": "1"})
+    assert response.status_code == 302
+    assert response.location.endswith("/login?next=/items")
+
+
+def test_handler_has_admin_control_room_and_mutation_access(client):
+    browser_login = client.post("/login", data={"username": "handler", "password": "handler123"}, follow_redirects=True)
+    assert b"Control room" in browser_login.data
+    token = handler_token(client)
+    response = client.post("/api/items", json={"name": "Handler Item", "unit_count": 1}, headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 201
+
+
+def test_staff_can_settle_due_late_fee(client, app):
+    seed(client, deposit="100", late_fee="10")
+    unit_id, borrower_id = ids(app)
+    due = (datetime.now() - timedelta(days=1)).replace(microsecond=0).isoformat(sep=" ")
+    checkout = (datetime.now() - timedelta(days=4)).replace(microsecond=0).isoformat(sep=" ")
+    with app.app_context():
+        db = app.get_db()
+        db.execute("INSERT INTO loans (unit_id, borrower_id, checkout_at, due_at, deposit_amount, deposit_status) VALUES (?, ?, ?, ?, ?, 'held')", (unit_id, borrower_id, checkout, due, "100.00"))
+        db.commit()
+        loan_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    client.post(f"/loans/{loan_id}/return", follow_redirects=True)
+    client.post("/login", data={"username": "handler", "password": "handler123"})
+    with app.app_context():
+        payment_id = app.get_db().execute("SELECT id FROM payments WHERE payment_type = 'late_fee'").fetchone()["id"]
+    response = client.post(f"/admin/payments/{payment_id}/settle", follow_redirects=True)
+    with app.app_context():
+        db = app.get_db()
+        payment = db.execute("SELECT status FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        loan = db.execute("SELECT deposit_status FROM loans WHERE id = ?", (loan_id,)).fetchone()
+    assert b"Settled INR 10.00 late fee" in response.data
+    assert payment["status"] == "paid"
+    assert loan["deposit_status"] == "fully_refunded"
+    deposits = client.get("/deposits")
+    assert b"Fee payment" in deposits.data
+    assert b">Paid</span>" in deposits.data
+    assert b"Fully Refunded" in deposits.data
+
+
+def test_zero_refund_balance_reconciles_to_fully_refunded(client, app):
+    seed(client, deposit="100", late_fee="0")
+    unit_id, borrower_id = ids(app)
+    due = (datetime.now() - timedelta(days=1)).replace(microsecond=0).isoformat(sep=" ")
+    checkout = (datetime.now() - timedelta(days=4)).replace(microsecond=0).isoformat(sep=" ")
+    with app.app_context():
+        db = app.get_db()
+        db.execute("INSERT INTO loans (unit_id, borrower_id, checkout_at, due_at, deposit_amount, deposit_status) VALUES (?, ?, ?, ?, ?, 'held')", (unit_id, borrower_id, checkout, due, "100.00"))
+        db.commit()
+        loan_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    client.post(f"/loans/{loan_id}/return", follow_redirects=True)
+    with app.app_context():
+        db = app.get_db()
+        db.execute("INSERT INTO payments (loan_id, payment_type, direction, amount, status, paid_at) VALUES (?, 'refund', 'refund', '100.00', 'paid', CURRENT_TIMESTAMP)", (loan_id,))
+        db.execute("UPDATE loans SET deposit_status = 'partially_refunded' WHERE id = ?", (loan_id,))
+        db.commit()
+    client.get("/deposits")
     with app.app_context():
         status = app.get_db().execute("SELECT deposit_status FROM loans WHERE id = ?", (loan_id,)).fetchone()["deposit_status"]
     assert status == "fully_refunded"

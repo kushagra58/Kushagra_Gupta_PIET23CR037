@@ -1,6 +1,6 @@
 {% extends "base.html" %}
-{% block title %}Admin login | Auriga Drive{% endblock %}
+{% block title %}Staff login | Auriga Drive{% endblock %}
 {% block content %}
-<section class="page-heading compact"><div><p class="eyebrow">Restricted area</p><h1>Admin control room.</h1><p class="lede">Manage unit condition and status, inspect payments, and use the authenticated API.</p></div></section>
-<section class="form-card narrow"><form method="post" action="{{ url_for('admin_login') }}"><label>Username<input name="username" value="admin" required></label><label>Password<input name="password" type="password" required></label><button class="button primary wide" type="submit">Sign in</button></form><p class="login-hint">The seeded local demo account is <strong>admin</strong> / <strong>admin123</strong>. Change it with `ADMIN_PASSWORD` before deployment.</p></section>
+<section class="page-heading compact"><div><p class="eyebrow">Staff access</p><h1>Sign in to make changes.</h1><p class="lede">Admins have full control. Handlers can check out, return, and transfer gear. Other visitors can browse only.</p></div></section>
+<section class="form-card narrow"><form method="post" action="{{ url_for('login') }}"><label>Username<input name="username" value="{{ 'admin' if not handler_login else 'handler' }}" required></label><label>Password<input name="password" type="password" required></label><button class="button primary wide" type="submit">Sign in</button></form><p class="login-hint">Demo admin: <strong>admin</strong> / <strong>admin123</strong>. Demo handler: <strong>handler</strong> / <strong>handler123</strong>.</p></section>
 {% endblock %}

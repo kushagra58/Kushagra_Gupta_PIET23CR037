@@ -2,6 +2,7 @@ import logging
 import os
 import sqlite3
 import uuid
+from functools import wraps
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -28,6 +29,8 @@ def create_app(test_config=None):
         JWT_SECRET_KEY=os.environ.get("JWT_SECRET_KEY", os.environ.get("SECRET_KEY", "dev-jwt-key-change-me-please-32-bytes")),
         ADMIN_USERNAME=os.environ.get("ADMIN_USERNAME", "admin"),
         ADMIN_PASSWORD=os.environ.get("ADMIN_PASSWORD", "admin123"),
+        HANDLER_USERNAME=os.environ.get("HANDLER_USERNAME", "handler"),
+        HANDLER_PASSWORD=os.environ.get("HANDLER_PASSWORD", "handler123"),
     )
     if test_config:
         app.config.update(test_config)
@@ -59,6 +62,10 @@ def create_app(test_config=None):
         item_columns = {row[1] for row in db.execute("PRAGMA table_info(items)").fetchall()}
         if "image_url" not in item_columns:
             db.execute("ALTER TABLE items ADD COLUMN image_url TEXT NOT NULL DEFAULT ''")
+        transfer_columns = {row[1] for row in db.execute("PRAGMA table_info(loan_transfers)").fetchall()}
+        for column, definition in (("status", "TEXT NOT NULL DEFAULT 'approved'"), ("requested_by_user_id", "INTEGER"), ("decided_by_user_id", "INTEGER"), ("decided_at", "TEXT"), ("decision_note", "TEXT NOT NULL DEFAULT ''")):
+            if column not in transfer_columns:
+                db.execute(f"ALTER TABLE loan_transfers ADD COLUMN {column} {definition}")
         if app.config["AUTO_SEED"] and not app.config.get("TESTING"):
             from seed import expand_demo_data, seed_database
 
@@ -67,6 +74,9 @@ def create_app(test_config=None):
         if not db.execute("SELECT 1 FROM users WHERE username = ?", (app.config["ADMIN_USERNAME"],)).fetchone():
             db.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'admin')",
                        (app.config["ADMIN_USERNAME"], generate_password_hash(app.config["ADMIN_PASSWORD"])))
+        if not db.execute("SELECT 1 FROM users WHERE username = ?", (app.config["HANDLER_USERNAME"],)).fetchone():
+            db.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'operator')",
+                       (app.config["HANDLER_USERNAME"], generate_password_hash(app.config["HANDLER_PASSWORD"])))
         db.commit()
 
     app.init_db = init_db
@@ -118,6 +128,27 @@ def create_app(test_config=None):
         db.execute("UPDATE loans SET amount_due = ?, amount_paid = ? WHERE id = ?", (str(summary["amount_due"]), str(summary["amount_paid"]), loan_id))
         return summary
 
+    def finance_totals(db):
+        late_fee = db.execute("SELECT COALESCE(SUM(late_fee), 0) AS total FROM loans").fetchone()["total"]
+        late_fee_due = db.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM payments WHERE payment_type = 'late_fee' AND direction = 'charge' AND status = 'due'").fetchone()["total"]
+        refund_due = Decimal("0.00")
+        for loan in db.execute("SELECT id FROM loans WHERE returned_at IS NOT NULL AND refund_amount > 0").fetchall():
+            refund_due += payment_summary(db, loan["id"])["refund_due"]
+        return {"late_fee_total": Decimal(str(late_fee or 0)), "late_fee_due_total": Decimal(str(late_fee_due or 0)), "refund_due_total": refund_due}
+
+    def reconcile_refund_statuses(db):
+        changed = False
+        loans = db.execute("SELECT id, deposit_status FROM loans WHERE returned_at IS NOT NULL AND refund_amount > 0").fetchall()
+        for loan in loans:
+            if loan["deposit_status"] != "fully_refunded" and payment_summary(db, loan["id"])["refund_due"] <= 0:
+                db.execute("UPDATE loans SET deposit_status = 'fully_refunded' WHERE id = ?", (loan["id"],))
+                changed = True
+        if changed:
+            db.commit()
+
+    def late_fee_payment(db, loan_id):
+        return db.execute("SELECT * FROM payments WHERE loan_id = ? AND payment_type = 'late_fee' ORDER BY id DESC LIMIT 1", (loan_id,)).fetchone()
+
     def json_value(value):
         if isinstance(value, Decimal):
             return f"{value:.2f}"
@@ -128,8 +159,12 @@ def create_app(test_config=None):
 
     def admin_api_required():
         claims = get_jwt()
-        if claims.get("role") != "admin":
-            abort(403, description="Admin role required")
+        if claims.get("role") not in {"admin", "operator"}:
+            abort(403, description="Admin or handler role required")
+
+    def operator_api_required():
+        if get_jwt().get("role") not in {"admin", "operator"}:
+            abort(403, description="Admin or handler role required")
 
     def active_overlap(db, unit_id, start_at, end_at, exclude_loan_id=None):
         query = """SELECT id FROM loans
@@ -140,6 +175,68 @@ def create_app(test_config=None):
             query += " AND id != ?"
             params.append(exclude_loan_id)
         return db.execute(query, params).fetchone()
+
+    def transfer_loan(db, loan_id, borrower_id, changed_by_user_id=None):
+        loan = db.execute("SELECT id, borrower_id, returned_at FROM loans WHERE id = ?", (loan_id,)).fetchone()
+        borrower = db.execute("SELECT id, name FROM borrowers WHERE id = ?", (borrower_id,)).fetchone()
+        if not loan or loan["returned_at"]:
+            raise ValueError("Only an active loan can be transferred.")
+        if not borrower:
+            raise ValueError("Choose a valid borrower.")
+        if loan["borrower_id"] == borrower_id:
+            raise ValueError("The loan already belongs to this borrower.")
+        db.execute("INSERT INTO loan_transfers (loan_id, from_borrower_id, to_borrower_id, changed_by_user_id) VALUES (?, ?, ?, ?)",
+                   (loan_id, loan["borrower_id"], borrower_id, changed_by_user_id))
+        db.execute("UPDATE loans SET borrower_id = ? WHERE id = ?", (borrower_id, loan_id))
+        return borrower["name"]
+
+    def request_transfer(db, loan_id, borrower_id, requested_by_user_id):
+        loan = db.execute("SELECT id, borrower_id, returned_at FROM loans WHERE id = ?", (loan_id,)).fetchone()
+        borrower = db.execute("SELECT id, name FROM borrowers WHERE id = ?", (borrower_id,)).fetchone()
+        if not loan or loan["returned_at"]:
+            raise ValueError("Only an active loan can be transferred.")
+        if not borrower or loan["borrower_id"] == borrower_id:
+            raise ValueError("Choose a different valid borrower.")
+        pending = db.execute("SELECT id FROM loan_transfers WHERE loan_id = ? AND status = 'pending'", (loan_id,)).fetchone()
+        if pending:
+            raise ValueError("This loan already has a transfer waiting for approval.")
+        db.execute("INSERT INTO loan_transfers (loan_id, from_borrower_id, to_borrower_id, requested_by_user_id, changed_by_user_id, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+                   (loan_id, loan["borrower_id"], borrower_id, requested_by_user_id, requested_by_user_id))
+        return borrower["name"]
+
+    def latest_transfer(db, loan_id):
+        return db.execute("""SELECT loan_transfers.*, from_borrower.name AS from_name,
+            to_borrower.name AS to_name, users.username AS changed_by
+            FROM loan_transfers
+            JOIN borrowers AS from_borrower ON from_borrower.id = loan_transfers.from_borrower_id
+            JOIN borrowers AS to_borrower ON to_borrower.id = loan_transfers.to_borrower_id
+            LEFT JOIN users ON users.id = loan_transfers.changed_by_user_id
+            WHERE loan_transfers.loan_id = ? AND loan_transfers.status = 'approved' ORDER BY loan_transfers.transferred_at DESC LIMIT 1""", (loan_id,)).fetchone()
+
+    def pending_transfer(db, loan_id):
+        return db.execute("""SELECT loan_transfers.*, from_borrower.name AS from_name,
+            to_borrower.name AS to_name, users.username AS requested_by
+            FROM loan_transfers
+            JOIN borrowers AS from_borrower ON from_borrower.id = loan_transfers.from_borrower_id
+            JOIN borrowers AS to_borrower ON to_borrower.id = loan_transfers.to_borrower_id
+            LEFT JOIN users ON users.id = loan_transfers.requested_by_user_id
+            WHERE loan_transfers.loan_id = ? AND loan_transfers.status = 'pending'
+            ORDER BY loan_transfers.transferred_at DESC LIMIT 1""", (loan_id,)).fetchone()
+
+    def transfer_history(db, loan_id):
+        return db.execute("""SELECT loan_transfers.*, from_borrower.name AS from_name,
+            to_borrower.name AS to_name, users.username AS changed_by
+            FROM loan_transfers
+            JOIN borrowers AS from_borrower ON from_borrower.id = loan_transfers.from_borrower_id
+            JOIN borrowers AS to_borrower ON to_borrower.id = loan_transfers.to_borrower_id
+            LEFT JOIN users ON users.id = loan_transfers.changed_by_user_id
+            WHERE loan_transfers.loan_id = ? ORDER BY loan_transfers.transferred_at""", (loan_id,)).fetchall()
+
+    def operator_required():
+        if app.config.get("TESTING") or session.get("user_role") in {"admin", "operator"}:
+            return None
+        flash("Sign in as admin or handler before changing lending data.", "error")
+        return redirect(url_for("login", next=request.path))
 
     def refresh_overdue(db):
         db.execute("UPDATE loans SET status = 'overdue' WHERE returned_at IS NULL AND due_at < ?", (now().isoformat(sep=" "),))
@@ -158,7 +255,7 @@ def create_app(test_config=None):
 
     @app.context_processor
     def inject_helpers():
-        return {"today": now().date().isoformat(), "default_loan_days": DEFAULT_LOAN_DAYS, "payment_summary": lambda loan_id: payment_summary(get_db(), loan_id)}
+        return {"today": now().date().isoformat(), "default_loan_days": DEFAULT_LOAN_DAYS, "payment_summary": lambda loan_id: payment_summary(get_db(), loan_id), "late_fee_payment": lambda loan_id: late_fee_payment(get_db(), loan_id), "latest_transfer": lambda loan_id: latest_transfer(get_db(), loan_id), "pending_transfer": lambda loan_id: pending_transfer(get_db(), loan_id), "transfer_history": lambda loan_id: transfer_history(get_db(), loan_id)}
 
     @app.route("/")
     def dashboard():
@@ -173,6 +270,7 @@ def create_app(test_config=None):
             borrowers.name AS borrower_name FROM loans JOIN units ON units.id = loans.unit_id
             JOIN items ON items.id = units.item_id JOIN borrowers ON borrowers.id = loans.borrower_id
             WHERE loans.returned_at IS NULL ORDER BY loans.due_at""").fetchall()
+        borrowers = db.execute("SELECT * FROM borrowers ORDER BY name").fetchall()
         current = now().isoformat(sep=" ")
         stats = db.execute("""SELECT COUNT(*) AS units,
             SUM(CASE WHEN units.status = 'available' AND NOT EXISTS (
@@ -181,10 +279,14 @@ def create_app(test_config=None):
             ) THEN 1 ELSE 0 END) AS available,
             SUM(CASE WHEN status = 'maintenance' THEN 1 ELSE 0 END) AS maintenance FROM units""", (current, current)).fetchone()
         items = db.execute("SELECT * FROM items ORDER BY name").fetchall()
-        return render_template("dashboard.html", overdue=overdue, active=active, stats=stats, items=items)
+        return render_template("dashboard.html", overdue=overdue, active=active, stats=stats, items=items, borrowers=borrowers)
 
     @app.post("/items")
     def add_item():
+        if request.method == "POST":
+            denied = operator_required()
+            if denied:
+                return denied
         db = get_db()
         try:
             name = request.form["name"].strip()
@@ -212,6 +314,9 @@ def create_app(test_config=None):
 
     @app.post("/borrowers")
     def add_borrower():
+        denied = operator_required()
+        if denied:
+            return denied
         db = get_db()
         try:
             db.execute("INSERT INTO borrowers (name, borrower_code, contact, club_department) VALUES (?, ?, ?, ?)",
@@ -226,6 +331,10 @@ def create_app(test_config=None):
 
     @app.route("/checkout", methods=["GET", "POST"])
     def checkout():
+        if request.method == "POST":
+            denied = operator_required()
+            if denied:
+                return denied
         db = get_db()
         if request.method == "POST":
             try:
@@ -271,6 +380,9 @@ def create_app(test_config=None):
 
     @app.post("/loans/<int:loan_id>/return")
     def return_loan(loan_id):
+        denied = operator_required()
+        if denied:
+            return denied
         db = get_db()
         loan = db.execute("SELECT loans.*, items.late_fee_per_day, units.asset_tag FROM loans JOIN units ON units.id = loans.unit_id JOIN items ON items.id = units.item_id WHERE loans.id = ?", (loan_id,)).fetchone()
         if not loan or loan["returned_at"]:
@@ -293,8 +405,27 @@ def create_app(test_config=None):
         flash(f"Returned {loan['asset_tag']}. Late fee: {money_filter(late_fee)}. Refund due: {money_filter(refund)}.", "success")
         return redirect(url_for("dashboard"))
 
+    @app.post("/loans/<int:loan_id>/transfer")
+    def transfer_web_loan(loan_id):
+        denied = operator_required()
+        if denied:
+            return denied
+        db = get_db()
+        try:
+            borrower_id = int(request.form["borrower_id"])
+            borrower_name = request_transfer(db, loan_id, borrower_id, session.get("user_id"))
+            db.commit()
+            flash(f"Transfer request for {borrower_name} is waiting for admin approval. The current borrower and due date remain unchanged.", "success")
+        except (ValueError, KeyError):
+            db.rollback()
+            flash("The active loan could not be transferred.", "error")
+        return redirect(url_for("dashboard"))
+
     @app.post("/loans/<int:loan_id>/nudge")
     def nudge(loan_id):
+        denied = operator_required()
+        if denied:
+            return denied
         db = get_db()
         loan = db.execute("SELECT loans.*, units.asset_tag, items.name AS item_name, borrowers.name AS borrower_name FROM loans JOIN units ON units.id = loans.unit_id JOIN items ON items.id = units.item_id JOIN borrowers ON borrowers.id = loans.borrower_id WHERE loans.id = ? AND loans.returned_at IS NULL", (loan_id,)).fetchone()
         if loan:
@@ -333,6 +464,7 @@ def create_app(test_config=None):
     @app.route("/deposits")
     def deposits():
         db = get_db()
+        reconcile_refund_statuses(db)
         loans = db.execute("""SELECT loans.*, units.asset_tag, items.name AS item_name,
             borrowers.name AS borrower_name
             FROM loans JOIN units ON units.id = loans.unit_id
@@ -340,7 +472,7 @@ def create_app(test_config=None):
             JOIN borrowers ON borrowers.id = loans.borrower_id
             WHERE loans.deposit_amount > 0
             ORDER BY loans.returned_at IS NULL DESC, loans.due_at""").fetchall()
-        return render_template("deposits.html", loans=loans)
+        return render_template("deposits.html", loans=loans, totals=finance_totals(db))
 
     @app.post("/api/auth/login")
     def api_login():
@@ -351,25 +483,42 @@ def create_app(test_config=None):
         token = create_access_token(identity=str(user["id"]), additional_claims={"role": user["role"], "username": user["username"]})
         return jsonify({"access_token": token, "user": {"id": user["id"], "username": user["username"], "role": user["role"]}})
 
-    @app.post("/admin/login")
-    def admin_login():
+    def browser_login():
         data = request.form
         user = get_db().execute("SELECT * FROM users WHERE username = ? AND is_active = 1", (data.get("username", "").strip(),)).fetchone()
-        if not user or user["role"] != "admin" or not check_password_hash(user["password_hash"], data.get("password", "")):
-            flash("Invalid admin credentials.", "error")
-            return redirect(url_for("admin"))
-        session["admin_user_id"] = user["id"]
+        if not user or not check_password_hash(user["password_hash"], data.get("password", "")):
+            flash("Invalid username or password.", "error")
+            return redirect(url_for("login"))
+        session["user_id"] = user["id"]
+        session["user_role"] = user["role"]
+        session["username"] = user["username"]
+        if user["role"] == "admin":
+            session["admin_user_id"] = user["id"]
         return redirect(url_for("admin"))
+
+    @app.route("/login", methods=["GET", "POST"])
+    def login():
+        if request.method == "POST":
+            return browser_login()
+        return render_template("admin_login.html", handler_login=True)
+
+    @app.post("/admin/login")
+    def admin_login():
+        return browser_login()
 
     @app.post("/admin/logout")
     def admin_logout():
         session.pop("admin_user_id", None)
+        session.pop("user_id", None)
+        session.pop("user_role", None)
+        session.pop("username", None)
         return redirect(url_for("admin"))
 
     @app.route("/admin")
     def admin():
         db = get_db()
-        if not session.get("admin_user_id"):
+        reconcile_refund_statuses(db)
+        if session.get("user_role") not in {"admin", "operator"}:
             return render_template("admin_login.html")
         units = db.execute("SELECT units.*, items.name AS item_name FROM units JOIN items ON items.id = units.item_id ORDER BY items.name, units.asset_tag").fetchall()
         items = db.execute("SELECT items.*, COUNT(units.id) AS unit_count FROM items LEFT JOIN units ON units.item_id = items.id GROUP BY items.id ORDER BY items.name").fetchall()
@@ -385,11 +534,19 @@ def create_app(test_config=None):
             JOIN items ON items.id = units.item_id JOIN borrowers ON borrowers.id = loans.borrower_id
             WHERE loans.returned_at IS NOT NULL AND loans.refund_amount > 0
             ORDER BY loans.returned_at DESC""").fetchall()
-        return render_template("admin.html", units=units, items=items, borrowers=borrowers, payments=payments, refunds=refunds)
+        transfer_requests = db.execute("""SELECT loan_transfers.*, units.asset_tag, items.name AS item_name,
+            from_borrower.name AS from_name, to_borrower.name AS to_name, users.username AS requested_by
+            FROM loan_transfers JOIN loans ON loans.id = loan_transfers.loan_id
+            JOIN units ON units.id = loans.unit_id JOIN items ON items.id = units.item_id
+            JOIN borrowers AS from_borrower ON from_borrower.id = loan_transfers.from_borrower_id
+            JOIN borrowers AS to_borrower ON to_borrower.id = loan_transfers.to_borrower_id
+            LEFT JOIN users ON users.id = loan_transfers.requested_by_user_id
+            WHERE loan_transfers.status = 'pending' ORDER BY loan_transfers.transferred_at""").fetchall()
+        return render_template("admin.html", units=units, items=items, borrowers=borrowers, payments=payments, refunds=refunds, transfer_requests=transfer_requests, totals=finance_totals(db))
 
     @app.post("/admin/units/<int:unit_id>")
     def admin_update_unit(unit_id):
-        if not session.get("admin_user_id"):
+        if session.get("user_role") not in {"admin", "operator"}:
             return redirect(url_for("admin"))
         status = request.form.get("status")
         if status not in {"available", "maintenance", "retired"}:
@@ -401,9 +558,30 @@ def create_app(test_config=None):
             flash("Unit updated.", "success")
         return redirect(url_for("admin"))
 
+    @app.post("/admin/transfers/<int:transfer_id>/<action>")
+    def admin_decide_transfer(transfer_id, action):
+        if session.get("user_role") != "admin":
+            return redirect(url_for("admin"))
+        if action not in {"approve", "reject"}:
+            flash("Invalid transfer decision.", "error")
+            return redirect(url_for("admin"))
+        db = get_db()
+        transfer = db.execute("SELECT * FROM loan_transfers WHERE id = ? AND status = 'pending'", (transfer_id,)).fetchone()
+        if not transfer:
+            flash("Transfer request is no longer pending.", "error")
+            return redirect(url_for("admin"))
+        status = "approved" if action == "approve" else "rejected"
+        if status == "approved":
+            db.execute("UPDATE loans SET borrower_id = ? WHERE id = ? AND returned_at IS NULL", (transfer["to_borrower_id"], transfer["loan_id"]))
+        db.execute("UPDATE loan_transfers SET status = ?, decided_by_user_id = ?, decided_at = ?, decision_note = ? WHERE id = ?",
+                   (status, session["user_id"], now().isoformat(sep=" "), request.form.get("note", "").strip(), transfer_id))
+        db.commit()
+        flash(f"Transfer request {status}.", "success")
+        return redirect(url_for("admin"))
+
     @app.post("/admin/items/<int:item_id>/delete")
     def admin_delete_item(item_id):
-        if not session.get("admin_user_id"):
+        if session.get("user_role") not in {"admin", "operator"}:
             return redirect(url_for("admin"))
         db = get_db()
         try:
@@ -420,7 +598,7 @@ def create_app(test_config=None):
 
     @app.post("/admin/borrowers/<int:borrower_id>/delete")
     def admin_delete_borrower(borrower_id):
-        if not session.get("admin_user_id"):
+        if session.get("user_role") not in {"admin", "operator"}:
             return redirect(url_for("admin"))
         db = get_db()
         try:
@@ -437,7 +615,7 @@ def create_app(test_config=None):
 
     @app.post("/admin/loans/<int:loan_id>/refund")
     def admin_record_refund(loan_id):
-        if not session.get("admin_user_id"):
+        if session.get("user_role") not in {"admin", "operator"}:
             return redirect(url_for("admin"))
         db = get_db()
         loan = db.execute("SELECT id, returned_at, refund_amount FROM loans WHERE id = ?", (loan_id,)).fetchone()
@@ -458,6 +636,25 @@ def create_app(test_config=None):
         except (ValueError, sqlite3.IntegrityError) as exc:
             db.rollback()
             flash(str(exc), "error")
+        return redirect(url_for("admin"))
+
+    @app.post("/admin/payments/<int:payment_id>/settle")
+    def admin_settle_late_fee(payment_id):
+        if session.get("user_role") not in {"admin", "operator"}:
+            return redirect(url_for("admin"))
+        db = get_db()
+        payment = db.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
+        if not payment or payment["payment_type"] != "late_fee" or payment["status"] != "due":
+            flash("Only a due late-fee payment can be settled.", "error")
+            return redirect(url_for("admin"))
+        db.execute("UPDATE payments SET status = 'paid', paid_at = ?, note = ? WHERE id = ?",
+                   (now().isoformat(sep=" "), request.form.get("note", "Late fee settled by staff").strip(), payment_id))
+        loan = db.execute("SELECT deposit_status FROM loans WHERE id = ?", (payment["loan_id"],)).fetchone()
+        if loan and loan["deposit_status"] == "partially_refunded":
+            db.execute("UPDATE loans SET deposit_status = 'fully_refunded' WHERE id = ?", (payment["loan_id"],))
+        sync_payment_totals(db, payment["loan_id"])
+        db.commit()
+        flash(f"Settled {money_filter(payment['amount'])} late fee.", "success")
         return redirect(url_for("admin"))
 
     @app.errorhandler(403)
@@ -592,7 +789,7 @@ def create_app(test_config=None):
         db = get_db()
         rows = db.execute("SELECT loans.*, units.asset_tag, items.name AS item_name, borrowers.name AS borrower_name FROM loans JOIN units ON units.id = loans.unit_id JOIN items ON items.id = units.item_id JOIN borrowers ON borrowers.id = loans.borrower_id ORDER BY loans.checkout_at DESC").fetchall()
         if request.method == "POST":
-            admin_api_required()
+            operator_api_required()
             data = request.get_json() or {}
             try:
                 unit_id = int(data["unit_id"])
@@ -648,6 +845,42 @@ def create_app(test_config=None):
         data = row_json(loan)
         data.update({key: json_value(value) for key, value in payment_summary(db, loan_id).items()})
         return jsonify(data)
+
+    @app.patch("/api/loans/<int:loan_id>/transfer")
+    @jwt_required()
+    def api_transfer_loan(loan_id):
+        operator_api_required()
+        db = get_db()
+        data = request.get_json() or {}
+        try:
+            borrower_name = request_transfer(db, loan_id, int(data["borrower_id"]), int(get_jwt_identity()))
+            db.commit()
+            loan = db.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
+            result = row_json(loan)
+            result["transferred_to"] = borrower_name
+            result["transfer_status"] = "pending"
+            return jsonify(result)
+        except (KeyError, ValueError, sqlite3.IntegrityError) as exc:
+            db.rollback()
+            return jsonify({"error": str(exc)}), 400
+
+    @app.patch("/api/transfer-requests/<int:transfer_id>/<action>")
+    @jwt_required()
+    def api_decide_transfer(transfer_id, action):
+        if get_jwt().get("role") != "admin":
+            abort(403, description="Admin role required to approve transfers")
+        if action not in {"approve", "reject"}:
+            return jsonify({"error": "Action must be approve or reject"}), 400
+        db = get_db()
+        transfer = db.execute("SELECT * FROM loan_transfers WHERE id = ? AND status = 'pending'", (transfer_id,)).fetchone()
+        if not transfer:
+            return jsonify({"error": "Pending transfer request not found"}), 404
+        status = "approved" if action == "approve" else "rejected"
+        if status == "approved":
+            db.execute("UPDATE loans SET borrower_id = ? WHERE id = ? AND returned_at IS NULL", (transfer["to_borrower_id"], transfer["loan_id"]))
+        db.execute("UPDATE loan_transfers SET status = ?, decided_by_user_id = ?, decided_at = ?, decision_note = ? WHERE id = ?", (status, int(get_jwt_identity()), now().isoformat(sep=" "), data.get("note", "") if isinstance(data := (request.get_json(silent=True) or {}), dict) else "", transfer_id))
+        db.commit()
+        return jsonify({"id": transfer_id, "status": status, "loan_id": transfer["loan_id"]})
 
     @app.route("/api/payments", methods=["GET", "POST"])
     @jwt_required()

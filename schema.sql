@@ -70,6 +70,22 @@ CREATE TABLE IF NOT EXISTS payments (
 
 CREATE INDEX IF NOT EXISTS idx_payments_loan ON payments(loan_id, status, direction);
 
+CREATE TABLE IF NOT EXISTS loan_transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    loan_id INTEGER NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
+    from_borrower_id INTEGER NOT NULL REFERENCES borrowers(id) ON DELETE RESTRICT,
+    to_borrower_id INTEGER NOT NULL REFERENCES borrowers(id) ON DELETE RESTRICT,
+    changed_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'approved' CHECK (status IN ('pending', 'approved', 'rejected')),
+    requested_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    decided_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    decided_at TEXT,
+    decision_note TEXT NOT NULL DEFAULT '',
+    transferred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_loan_transfers_loan ON loan_transfers(loan_id, transferred_at);
+
 CREATE TABLE IF NOT EXISTS nudge_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     loan_id INTEGER NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
